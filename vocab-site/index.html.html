@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Daily Vocab Buddy</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <!-- Safelist for Tailwind state classes -->
+  <div class="hidden 
+    border-green-300 bg-green-100 text-green-800 
+    border-red-300 bg-red-100 text-red-800 
+    hover:bg-gray-50
+  "></div>
+  
+  <div id="root"></div>
+      
+      <!-- Tailwind safelist to prevent purging dynamic classes -->
+      <div class="hidden 
+        border-green-300 bg-green-100 text-green-800 
+        border-red-300 bg-red-100 text-red-800 
+        bg-green-600 bg-red-600 ring-green-300 ring-red-300 
+        hover:bg-gray-50 
+      "></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // Auto-advance configuration
+    const ADVANCE_DELAY_MS = 7000; // 7s to see feedback + details
+    const TOAST_MS = 1800; // 1.8s for toast to fade while buttons stay colored
+
+    // Utility functions
+    function safeId() {
+      if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+        return crypto.randomUUID();
+      }
+      return 'id-' + Math.random().toString(36).substr(2, 9) + '-' + Date.now().toString(36);
+    }
+
+    function todayKey(d = new Date()) {
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    }
+
+    function uniqList(list) {
+      return Array.from(new Set(list.filter(Boolean)));
+    }
+
+    function shuffle(array) {
+      const arr = [...array];
+      for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    }
+
+    function randomInt(min, max) {
+      return Math.floor(Math.random() * (max - min + 1)) + min;
+    }
+
+
+
+    function extractDataFromAPI(data) {
+      const synonyms = [];
+      const antonyms = [];
+      const examples = [];
+      
+      if (!Array.isArray(data)) return { synonyms, antonyms, examples };
+      
+      for (const entry of data) {
+        if (!entry?.meanings) continue;
+        for (const meaning of entry.meanings) {
+          if (Array.isArray(meaning?.synonyms)) synonyms.push(...meaning.synonyms);
+          if (Array.isArray(meaning?.antonyms)) antonyms.push(...meaning.antonyms);
+          if (Array.isArray(meaning?.definitions)) {
+            for (const def of meaning.definitions) {
+              if (Array.isArray(def?.synonyms)) synonyms.push(...def.synonyms);
+              if (Array.isArray(def?.antonyms)) antonyms.push(...def.antonyms);
+              if (def?.example) examples.push(def.example);
+            }
+          }
+        }
+      }
+      
+      return {
+        synonyms: uniqList(synonyms),
+        antonyms: uniqList(antonyms),
+        examples: uniqList(examples).slice(0, 3)
+      };
+    }
+
+    function unionSynonyms(apiSyns, userSyns) {
+      const combined = [...(apiSyns || []), ...(userSyns || [])];
+      const lowercaseSet = new Set();
+      return combined.filter(syn => {
+        const lower = syn.toLowerCase();
+        if (lowercaseSet.has(lower)) return false;
+        lowercaseSet.add(lower);
+        return true;
+      });
+    }
+
+    const STORAGE_KEY = "daily-vocab-words-single";
+    const FALLBACK_WORDS = ["banana", "mountain", "festival", "camera", "window", "galaxy", "pencil", "carpet", "robot", "lantern", "horizon", "pepper"];
+
+    function App() {
+      const [words, setWords] = useState([]);
+      const [newWord, setNewWord] = useState("");
+      const [newArti, setNewArti] = useState("");
+      const [newExample, setNewExample] = useState("");
+      const [newSynonyms, setNewSynonyms] = useState("");
+      const [newAntonyms, setNewAntonyms] = useState("");
+      const [showAdvanced, setShowAdvanced] = useState(false);
+      
+      const [popWord, setPopWord] = useState(null);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState("");
+      const [apiData, setApiData] = useState({ synonyms: [], antonyms: [], examples: [] });
+      const [mode, setMode] = useState("today");
+      const [showModal, setShowModal] = useState(false);
+      
+      // Quiz states
+      const [quizOptions, setQuizOptions] = useState([]);
+      const [quizCorrectIndex, setQuizCorrectIndex] = useState(-1);
+      const [quizPickedIndex, setQuizPickedIndex] = useState(null);
+      const [showResults, setShowResults] = useState(false);
+      const [quizSkipped, setQuizSkipped] = useState(false);
+      const [ariaMessage, setAriaMessage] = useState("");
+      
+      // Manual synonym/antonym states
+      const [showManualInput, setShowManualInput] = useState(false);
+      const [manualSynonyms, setManualSynonyms] = useState("");
+      const [manualAntonyms, setManualAntonyms] = useState("");
+      
+      // Spaced repetition states
+      const [qCount, setQCount] = useState(0);
+      const [reviewQueue, setReviewQueue] = useState([]);
+      const [lastWordId, setLastWordId] = useState(null);
+      
+      // Auto-advance states
+      const [autoAdvance, setAutoAdvance] = useState(true);
+      const [toast, setToast] = useState({ open: false, text: '', tone: 'neutral' });
+      const advanceTimerRef = useRef(null);
+      const questionTokenRef = useRef(0);
+
+      // Load & persist
+      useEffect(() => {
+        try {
+          const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+          if (Array.isArray(saved)) setWords(saved);
+        } catch {}
+      }, []);
+
+      useEffect(() => {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(words));
+        } catch {}
+      }, [words]);
+      
+      // Cleanup timer on unmount
+      useEffect(() => {
+        return () => {
+          if (advanceTimerRef.current) {
+            clearTimeout(advanceTimerRef.current);
+          }
+        };
+      }, []);
+
+      const todaysWords = useMemo(() => {
+        const key = todayKey();
+        return words.filter((w) => w.addedOn === key);
+      }, [words]);
+
+      const answered = quizPickedIndex !== null;
+
+      function showToast(text, tone = 'neutral', ms = TOAST_MS) {
+        setToast({ open: true, text, tone });
+        setTimeout(() => {
+          setToast(prev => ({ ...prev, open: false }));
+        }, ms);
+      }
+
+      function addWord() {
+        const text = newWord.trim();
+        if (!text) return;
+        
+        const exists = words.some((w) => w.text.toLowerCase() === text.toLowerCase());
+        if (exists) {
+          clearForm();
+          return;
+        }
+        
+        const wordObj = {
+          id: safeId(),
+          text,
+          addedOn: todayKey()
+        };
+        
+        if (newArti.trim()) wordObj.arti = newArti.trim();
+        if (newExample.trim()) wordObj.example_en = newExample.trim();
+        if (newSynonyms.trim()) {
+          wordObj.synonyms = newSynonyms.split(',').map(s => s.trim()).filter(Boolean);
+        }
+        if (newAntonyms.trim()) {
+          wordObj.antonyms = newAntonyms.split(',').map(s => s.trim()).filter(Boolean);
+        }
+        
+        setWords((prev) => [wordObj, ...prev]);
+        clearForm();
+      }
+
+      function clearForm() {
+        setNewWord("");
+        setNewArti("");
+        setNewExample("");
+        setNewSynonyms("");
+        setNewAntonyms("");
+        setShowAdvanced(false);
+      }
+
+      function removeWord(id) {
+        setWords((prev) => prev.filter((w) => w.id !== id));
+        // Remove from review queue if present
+        setReviewQueue(prev => prev.filter(item => item.wordId !== id));
+      }
+
+      function resetModalState() {
+        // Clear any pending timer
+        if (advanceTimerRef.current) {
+          clearTimeout(advanceTimerRef.current);
+          advanceTimerRef.current = null;
+        }
+        
+        setPopWord(null);
+        setApiData({ synonyms: [], antonyms: [], examples: [] });
+        setQuizOptions([]);
+        setQuizCorrectIndex(-1);
+        setQuizPickedIndex(null);
+        setShowResults(false);
+        setQuizSkipped(false);
+        setShowManualInput(false);
+        setManualSynonyms("");
+        setManualAntonyms("");
+        setError("");
+        setAriaMessage("");
+      }
+
+      function getNextWordFromQueue() {
+        // Check review queue first
+        const dueItems = reviewQueue.filter(item => item.dueAt <= qCount);
+        if (dueItems.length > 0) {
+          const reviewItem = dueItems[0];
+          const word = words.find(w => w.id === reviewItem.wordId);
+          if (word && word.id !== lastWordId) {
+            return word;
+          }
+        }
+        
+        // Regular selection
+        const pool = mode === "today" && todaysWords.length ? todaysWords : words;
+        const availableWords = pool.filter(w => w.id !== lastWordId);
+        
+        if (availableWords.length === 0) {
+          return pool.length > 0 ? pool[0] : null;
+        }
+        
+        return availableWords[Math.floor(Math.random() * availableWords.length)];
+      }
+
+      async function prepareQuestionFor(word) {
+        const token = ++questionTokenRef.current;
+        
+        try {
+          setLoading(true);
+          setError("");
+          
+          const res = await fetch(
+            `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word.text)}`
+          );
+          
+          // Check if this request is still current
+          if (token !== questionTokenRef.current) return;
+          
+          let apiSynonyms = [];
+          let apiAntonyms = [];
+          let apiExamples = [];
+          
+          if (res.ok) {
+            const data = await res.json();
+            const extracted = extractDataFromAPI(data);
+            apiSynonyms = extracted.synonyms;
+            apiAntonyms = extracted.antonyms;
+            apiExamples = extracted.examples;
+          }
+          
+          // Check again after async operation
+          if (token !== questionTokenRef.current) return;
+          
+          setApiData({ 
+            synonyms: apiSynonyms, 
+            antonyms: apiAntonyms, 
+            examples: apiExamples 
+          });
+          
+          // Combine API and user synonyms
+          const allSynonyms = unionSynonyms(apiSynonyms, word.synonyms);
+          
+          if (allSynonyms.length > 0) {
+            prepareQuiz(word, allSynonyms);
+          } else {
+            // No synonyms available, show manual input
+            setShowManualInput(true);
+            setQuizSkipped(true);
+          }
+        } catch (e) {
+          if (token !== questionTokenRef.current) return;
+          
+          setApiData({ synonyms: [], antonyms: [], examples: [] });
+          
+          // Try user synonyms
+          if (word.synonyms && word.synonyms.length > 0) {
+            prepareQuiz(word, word.synonyms);
+          } else {
+            setShowManualInput(true);
+            setQuizSkipped(true);
+          }
+        } finally {
+          if (token === questionTokenRef.current) {
+            setLoading(false);
+          }
+        }
+      }
+      
+      async function askNext() {
+        // Clear any pending auto-advance timer
+        if (advanceTimerRef.current) {
+          clearTimeout(advanceTimerRef.current);
+          advanceTimerRef.current = null;
+        }
+        
+        // Increment question count
+        setQCount(prev => prev + 1);
+        
+        // Choose next word
+        const pool = mode === "today" && todaysWords.length ? todaysWords : words;
+        if (!pool.length) {
+          setError("Add some words first ✍️");
+          return;
+        }
+        
+        const pick = getNextWordFromQueue();
+        if (!pick) {
+          setError("No words available");
+          return;
+        }
+        
+        // Reset UI state
+        setQuizOptions([]);
+        setQuizPickedIndex(null);
+        setQuizCorrectIndex(-1);
+        setShowResults(false);
+        setQuizSkipped(false);
+        setShowManualInput(false);
+        setManualSynonyms("");
+        setManualAntonyms("");
+        setError("");
+        setAriaMessage("");
+        
+        // Set new word and prepare question
+        setPopWord(pick);
+        setLastWordId(pick.id);
+        
+        // Prepare the question
+        await prepareQuestionFor(pick);
+      }
+      
+      async function pop() {
+        // Open modal if closed
+        if (!showModal) {
+          resetModalState();
+          setShowModal(true);
+        }
+        
+        // Start first question
+        await askNext();
+      }
+
+
+
+      function prepareQuiz(currentWord, synonyms) {
+        const correctOption = synonyms[Math.floor(Math.random() * synonyms.length)];
+        const correctIndex = Math.floor(Math.random() * 4);
+        
+        // Get decoy options
+        const userWords = words
+          .map(w => w.text)
+          .filter(w => 
+            w.toLowerCase() !== currentWord.text.toLowerCase() && 
+            !synonyms.some(s => s.toLowerCase() === w.toLowerCase())
+          );
+        
+        const availableDecoys = [...userWords, ...FALLBACK_WORDS];
+        const decoys = [];
+        
+        while (decoys.length < 3 && availableDecoys.length > 0) {
+          const randomIndex = Math.floor(Math.random() * availableDecoys.length);
+          const decoy = availableDecoys.splice(randomIndex, 1)[0];
+          if (!decoys.includes(decoy) && decoy.toLowerCase() !== correctOption.toLowerCase()) {
+            decoys.push(decoy);
+          }
+        }
+        
+        // Fill remaining slots if needed
+        while (decoys.length < 3) {
+          const fallback = FALLBACK_WORDS[Math.floor(Math.random() * FALLBACK_WORDS.length)];
+          if (!decoys.includes(fallback) && fallback.toLowerCase() !== correctOption.toLowerCase()) {
+            decoys.push(fallback);
+          }
+        }
+        
+        // Create options array with correct answer at correctIndex
+        const options = new Array(4);
+        options[correctIndex] = correctOption;
+        
+        let decoyIndex = 0;
+        for (let i = 0; i < 4; i++) {
+          if (i !== correctIndex) {
+            options[i] = decoys[decoyIndex++];
+          }
+        }
+        
+        setQuizOptions(options);
+        setQuizCorrectIndex(correctIndex);
+        setQuizSkipped(false);
+      }
+
+      function handleQuizAnswer(index) {
+        if (quizPickedIndex !== null) return; // Already answered
+        
+        setQuizPickedIndex(index);
+        
+        const isCorrect = index === quizCorrectIndex;
+        setAriaMessage(isCorrect ? "Correct!" : "Not quite...");
+        
+        if (isCorrect) {
+          // Remove from review queue if this was a review item
+          setReviewQueue(prev => prev.filter(item => item.wordId !== popWord.id));
+          showToast('Correct ✅', 'success');
+        } else {
+          // Add to review queue
+          const dueAt = qCount + randomInt(3, 5);
+          setReviewQueue(prev => {
+            const filtered = prev.filter(item => item.wordId !== popWord.id);
+            return [...filtered, { wordId: popWord.id, dueAt }];
+          });
+          showToast('Not quite ❌', 'error');
+        }
+        
+        // Show results immediately
+        setShowResults(true);
+        
+        // Auto-advance if enabled
+        if (autoAdvance) {
+          if (advanceTimerRef.current) clearTimeout(advanceTimerRef.current);
+          advanceTimerRef.current = window.setTimeout(() => {
+            askNext();
+          }, ADVANCE_DELAY_MS);
+        }
+      }
+
+      // Alias for any leftover references so old calls won't break
+      const handlePick = (i) => handleQuizAnswer(i);
+
+      function saveManualSynonymsAndQuiz() {
+        const synonyms = manualSynonyms.split(',').map(s => s.trim()).filter(Boolean);
+        const antonyms = manualAntonyms.split(',').map(s => s.trim()).filter(Boolean);
+        
+        if (synonyms.length === 0) {
+          setError("Please enter at least one synonym to start the quiz.");
+          return;
+        }
+        
+        // Update the word in storage
+        const updatedWords = words.map(w => {
+          if (w.id === popWord.id) {
+            return {
+              ...w,
+              synonyms: unionSynonyms(w.synonyms, synonyms),
+              antonyms: unionSynonyms(w.antonyms, antonyms)
+            };
+          }
+          return w;
+        });
+        
+        setWords(updatedWords);
+        
+        // Update current popWord
+        const updatedPopWord = updatedWords.find(w => w.id === popWord.id);
+        setPopWord(updatedPopWord);
+        
+        // Hide manual input and prepare quiz
+        setShowManualInput(false);
+        setError("");
+        
+        // Combine all synonyms for quiz
+        const allSynonyms = unionSynonyms(apiData.synonyms, synonyms);
+        prepareQuiz(updatedPopWord, allSynonyms);
+        
+        // Don't auto-advance until user answers the new quiz
+        setShowResults(false);
+      }
+
+      function getButtonClass(index) {
+        const baseClass = "rounded-xl px-3 py-2 border text-sm text-left transition-colors";
+        
+        if (!answered) {
+          return `${baseClass} border-gray-300 hover:bg-gray-50`;
+        }
+        
+        if (index === quizCorrectIndex) {
+          return `${baseClass} border-green-300 bg-green-100 text-green-800`;
+        }
+        
+        if (index === quizPickedIndex && index !== quizCorrectIndex) {
+          return `${baseClass} border-red-300 bg-red-100 text-red-800`;
+        }
+        
+        return `${baseClass} border-gray-300 bg-gray-50`;
+      }
+
+      return (
+        <div className="min-h-screen bg-gray-50 text-gray-900">
+          <div className="max-w-3xl mx-auto px-4 py-8">
+            <header className="mb-8">
+              <h1 className="text-3xl font-bold tracking-tight">Daily Vocab Buddy</h1>
+              <p className="text-gray-600">Save words, take synonym quizzes, and expand your vocabulary daily.</p>
+            </header>
+
+            {/* Add word */}
+            <div className="bg-white rounded-2xl shadow p-4 mb-6">
+              <div className="space-y-3">
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <input
+                    className="flex-1 rounded-xl border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    placeholder="Add a new word (required)"
+                    value={newWord}
+                    onChange={(e) => setNewWord(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) addWord();
+                    }}
+                  />
+                  <input
+                    className="flex-1 rounded-xl border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    placeholder="Indonesian meaning (optional)"
+                    value={newArti}
+                    onChange={(e) => setNewArti(e.target.value)}
+                  />
+                  <input
+                    className="flex-1 rounded-xl border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    placeholder="Example sentence (optional)"
+                    value={newExample}
+                    onChange={(e) => setNewExample(e.target.value)}
+                  />
+                </div>
+                
+                {/* Advanced section */}
+                <div>
+                  <button
+                    onClick={() => setShowAdvanced(!showAdvanced)}
+                    className="text-sm text-indigo-600 hover:text-indigo-700 mb-2"
+                  >
+                    {showAdvanced ? '▼' : '▶'} Advanced (synonyms & antonyms)
+                  </button>
+                  
+                  {showAdvanced && (
+                    <div className="flex flex-col sm:flex-row gap-3">
+                      <input
+                        className="flex-1 rounded-xl border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        placeholder="Synonyms (comma-separated, optional)"
+                        value={newSynonyms}
+                        onChange={(e) => setNewSynonyms(e.target.value)}
+                      />
+                      <input
+                        className="flex-1 rounded-xl border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        placeholder="Antonyms (comma-separated, optional)"
+                        value={newAntonyms}
+                        onChange={(e) => setNewAntonyms(e.target.value)}
+                      />
+                    </div>
+                  )}
+                </div>
+                
+                <button
+                  onClick={addWord}
+                  className="rounded-xl px-4 py-2 bg-indigo-600 text-white font-medium hover:bg-indigo-700 active:scale-[0.98]"
+                >
+                  Save Word
+                </button>
+              </div>
+              <div className="mt-3 text-sm text-gray-500">Words are stored only on your device.</div>
+            </div>
+
+            {/* Controls */}
+            <div className="bg-white rounded-2xl shadow p-4 mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <span className="text-sm text-gray-600">Pop from:</span>
+                <label className={`px-3 py-1 rounded-full border cursor-pointer ${mode === "today" ? "bg-indigo-50 border-indigo-400 text-indigo-700" : "border-gray-300"}`}>
+                  <input
+                    type="radio"
+                    name="mode"
+                    className="mr-2"
+                    checked={mode === "today"}
+                    onChange={() => setMode("today")}
+                  />
+                  today's words ({todaysWords.length})
+                </label>
+                <label className={`px-3 py-1 rounded-full border cursor-pointer ${mode === "all" ? "bg-indigo-50 border-indigo-400 text-indigo-700" : "border-gray-300"}`}>
+                  <input
+                    type="radio"
+                    name="mode"
+                    className="mr-2"
+                    checked={mode === "all"}
+                    onChange={() => setMode("all")}
+                  />
+                  all words ({words.length})
+                </label>
+              </div>
+              <button
+                onClick={pop}
+                className="rounded-xl px-4 py-2 bg-emerald-600 text-white font-medium hover:bg-emerald-700 active:scale-[0.98]"
+              >
+                Pop a word
+              </button>
+            </div>
+
+            {/* Word list */}
+            <section className="bg-white rounded-2xl shadow p-4">
+              <div className="flex items-center justify-between mb-2">
+                <h2 className="text-lg font-semibold">Your words</h2>
+                <span className="text-sm text-gray-500">{words.length} total</span>
+              </div>
+              {words.length === 0 ? (
+                <p className="text-gray-500">No words yet. Add one above!</p>
+              ) : (
+                <ul className="divide-y">
+                  {words.map((w) => (
+                    <li key={w.id} className="py-3 flex items-start justify-between">
+                      <div className="flex-1">
+                        <div className="font-medium">{w.text}</div>
+                        {w.arti && <div className="text-sm text-gray-600">🇮🇩 {w.arti}</div>}
+                        {w.example_en && <div className="text-sm text-gray-600 italic">"{w.example_en}"</div>}
+                        {w.synonyms && w.synonyms.length > 0 && (
+                          <div className="text-xs text-gray-500">Synonyms: {w.synonyms.join(', ')}</div>
+                        )}
+                        <div className="text-xs text-gray-500">added {w.addedOn}</div>
+                      </div>
+                      <button
+                        onClick={() => removeWord(w.id)}
+                        className="text-red-600 hover:text-red-700 text-sm ml-4"
+                      >
+                        delete
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            {/* Toast Notification */}
+            {toast.open && (
+              <div className={`fixed top-4 right-4 z-[9999] px-4 py-2 rounded-lg shadow-lg text-white font-medium transition-all duration-300 pointer-events-none ${
+                toast.tone === 'success' ? 'bg-green-600' :
+                toast.tone === 'error' ? 'bg-red-600' :
+                'bg-gray-600'
+              }`}>
+                {toast.text}
+              </div>
+            )}
+
+            {/* Modal */}
+            {showModal && (
+              <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center p-4 z-50" onClick={() => setShowModal(false)}>
+                <div className="bg-white rounded-2xl shadow-xl max-w-2xl w-full p-6 max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+                  <div className="flex items-start justify-between gap-4 mb-6">
+                    <div>
+                      <div className="text-sm text-gray-500">popped word</div>
+                      <h3 className="text-2xl font-bold">{popWord?.text || "—"}</h3>
+                      {popWord?.arti && <div className="text-gray-600">🇮🇩 {popWord.arti}</div>}
+                      {popWord?.addedOn && (
+                        <div className="text-xs text-gray-500">added {popWord.addedOn}</div>
+                      )}
+                    </div>
+                    <button onClick={() => setShowModal(false)} className="text-gray-500 hover:text-gray-700 text-xl">✕</button>
+                  </div>
+
+                  {/* Aria live region for announcements */}
+                  <div aria-live="polite" className="sr-only">{ariaMessage}</div>
+
+                  {loading && (
+                    <div className="text-center py-8">
+                      <div className="text-gray-600">Preparing quiz…</div>
+                    </div>
+                  )}
+
+                  {error && (
+                    <div className="text-rose-600 text-sm mb-4">{error}</div>
+                  )}
+
+                  {/* Manual synonym/antonym input */}
+                  {showManualInput && !loading && (
+                    <div className="mb-6 p-4 border border-gray-200 rounded-xl">
+                      <h4 className="text-lg font-semibold mb-4">Add synonyms/antonyms for this word</h4>
+                      <div className="space-y-3">
+                        <input
+                          className="w-full rounded-xl border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                          placeholder="Synonyms (comma-separated, required to start quiz)"
+                          value={manualSynonyms}
+                          onChange={(e) => setManualSynonyms(e.target.value)}
+                        />
+                        <input
+                          className="w-full rounded-xl border border-gray-300 px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                          placeholder="Antonyms (comma-separated, optional)"
+                          value={manualAntonyms}
+                          onChange={(e) => setManualAntonyms(e.target.value)}
+                        />
+                        <div className="flex gap-3">
+                          <button
+                            onClick={saveManualSynonymsAndQuiz}
+                            disabled={!manualSynonyms.trim()}
+                            className="rounded-xl px-4 py-2 bg-indigo-600 text-white font-medium hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            Save & Make Quiz
+                          </button>
+                          <button
+                            onClick={() => setShowModal(false)}
+                            className="rounded-xl px-4 py-2 border border-gray-300 text-gray-700 hover:bg-gray-50"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Quiz Section */}
+                  {!loading && !error && quizOptions.length > 0 && !showResults && !showManualInput && (
+                    <div className="mb-6">
+                      <h4 className="text-lg font-semibold mb-4">
+                        Which one is most alike (a synonym) of "{popWord?.text}"?
+                      </h4>
+                      <div className="grid gap-3">
+                        {quizOptions.map((option, index) => {
+                          let buttonClasses = "rounded-xl px-3 py-2 border text-sm transition-colors ";
+                          
+                          if (quizPickedIndex !== null) {
+                            // After answering, show persistent colors
+                            if (index === quizCorrectIndex) {
+                              buttonClasses += "border-green-300 bg-green-100 text-green-800";
+                            } else if (index === quizPickedIndex) {
+                              buttonClasses += "border-red-300 bg-red-100 text-red-800";
+                            } else {
+                              buttonClasses += "border-gray-300 hover:bg-gray-50";
+                            }
+                          } else {
+                            // Before answering, default styling
+                            buttonClasses += "border-gray-300 hover:bg-gray-50";
+                          }
+                          
+                          return (
+                            <button
+                              key={index}
+                              onClick={() => handlePick(index)}
+                              disabled={quizPickedIndex !== null}
+                              aria-pressed={quizPickedIndex === index}
+                              className={`${buttonClasses} disabled:cursor-not-allowed`}
+                            >
+                              {option}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Quiz skipped message */}
+                  {quizSkipped && !loading && !showManualInput && (
+                    <div className="text-gray-600 text-sm mb-4">
+                      No quiz for this word (no synonyms found)
+                    </div>
+                  )}
+
+                  {/* Results Section */}
+                  {showResults && (
+                    <div className="space-y-4">
+                      {/* Combined synonyms */}
+                      {(unionSynonyms(apiData.synonyms, popWord?.synonyms).length > 0) && (
+                        <div>
+                          <div className="text-sm font-semibold mb-2">Synonyms</div>
+                          <div className="flex flex-wrap gap-2">
+                            {unionSynonyms(apiData.synonyms, popWord?.synonyms).slice(0, 30).map((s, i) => (
+                              <span key={i} className="px-2 py-1 rounded-full bg-indigo-50 text-indigo-700 text-xs border border-indigo-100">
+                                {s}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      
+                      {/* Combined antonyms */}
+                      {(unionSynonyms(apiData.antonyms, popWord?.antonyms).length > 0) && (
+                        <div>
+                          <div className="text-sm font-semibold mb-2">Antonyms</div>
+                          <div className="flex flex-wrap gap-2">
+                            {unionSynonyms(apiData.antonyms, popWord?.antonyms).slice(0, 30).map((a, i) => (
+                              <span key={i} className="px-2 py-1 rounded-full bg-rose-50 text-rose-700 text-xs border border-rose-100">
+                                {a}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      
+                      {/* Examples */}
+                      {(apiData.examples.length > 0 || popWord?.example_en) && (
+                        <div>
+                          <div className="text-sm font-semibold mb-2">Example sentences</div>
+                          <ul className="space-y-2">
+                            {popWord?.example_en && (
+                              <li className="text-sm text-gray-700 italic">
+                                "{popWord.example_en}" <span className="text-xs text-gray-500">(your example)</span>
+                              </li>
+                            )}
+                            {apiData.examples.map((example, i) => (
+                              <li key={i} className="text-sm text-gray-700 italic">
+                                "{example}"
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      
+                      {/* Auto-advance controls */}
+                      {!showManualInput && (
+                        <div className="flex items-center justify-between pt-3 border-t border-gray-200">
+                          <div className="flex items-center gap-3">
+                            <button
+                              onClick={() => askNext()}
+                              className="rounded-lg px-3 py-1 bg-indigo-600 text-white text-sm font-medium hover:bg-indigo-700"
+                            >
+                              Next now
+                            </button>
+                            <label className="flex items-center gap-2 text-sm text-gray-600">
+                              <input
+                                type="checkbox"
+                                checked={autoAdvance}
+                                onChange={(e) => setAutoAdvance(e.target.checked)}
+                                className="rounded"
+                              />
+                              Auto next
+                            </label>
+                          </div>
+                          {autoAdvance && advanceTimerRef.current && (
+                            <div className="text-xs text-gray-500">
+                              Next in {Math.ceil(ADVANCE_DELAY_MS / 1000)}s...
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="mt-6 text-xs text-gray-500">
+                    Powered by <a className="underline" href="https://dictionaryapi.dev/" target="_blank" rel="noreferrer">Dictionary API</a> • Data may vary by word
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <footer className="mt-12 text-sm text-gray-500">
+              Pro tip: Take the quiz seriously to improve your vocabulary retention! {reviewQueue.length > 0 && `(${reviewQueue.length} words in review queue)`}
+            </footer>
+          </div>
+        </div>
+      );
+    }
+
+    // Render the app
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
