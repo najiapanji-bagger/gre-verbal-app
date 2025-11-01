@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Daily Vocab Buddy — LocalStorage Enhanced</title>
+  <title>Daily Vocab Buddy — LocalStorage Enhanced (Resilient)</title>
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -18,17 +18,70 @@
   <script type="text/babel">
     const { useEffect, useMemo, useRef, useState } = React;
 
+    // =============================
+    // Storage shim (handles sandbox)
+    // =============================
+    function createSafeStore(namespace) {
+      const mem = { value: null };
+      let localOk = false;
+      try {
+        const k = `__test_${namespace}__`;
+        window.localStorage.setItem(k, "1");
+        window.localStorage.removeItem(k);
+        localOk = true;
+      } catch (err) {
+        localOk = false; // e.g. sandbox blocks localStorage
+      }
+      return {
+        localOk: () => localOk,
+        load(defaultVal) {
+          if (localOk) {
+            try {
+              const raw = window.localStorage.getItem(namespace);
+              if (!raw) return defaultVal;
+              const parsed = JSON.parse(raw);
+              return Array.isArray(parsed) ? parsed : defaultVal;
+            } catch (e) {
+              return defaultVal;
+            }
+          } else {
+            return mem.value ?? defaultVal;
+          }
+        },
+        save(value) {
+          if (localOk) {
+            try {
+              window.localStorage.setItem(namespace, JSON.stringify(value));
+            } catch (e) {
+              // quota or later failure -> fall back silently
+              mem.value = value;
+              localOk = false;
+            }
+          } else {
+            mem.value = value;
+          }
+        },
+        clear() {
+          try { if (localOk) window.localStorage.removeItem(namespace); } catch {}
+          mem.value = null;
+        }
+      };
+    }
+
     // ===== Utilities =====
     const STORAGE_KEY = 'daily-vocab-words-single';
+    const storeRef = { current: createSafeStore(STORAGE_KEY) };
+
     const DATE_FMT = (d = new Date()) => {
       const y = d.getFullYear();
       const m = String(d.getMonth() + 1).padStart(2, '0');
       const day = String(d.getDate()).padStart(2, '0');
       return `${y}-${m}-${day}`;
     };
-    const uid = () => (crypto?.randomUUID ? crypto.randomUUID() : `id-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    const uid = () => (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `id-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 
     const defaultStats = () => ({ attempts: 0, correct: 0, wrong: 0, streak: 0, lastResult: null, lastAnsweredAt: null, accuracy: 0 });
+    const uniqueList = (arr=[]) => Array.from(new Set(arr.map(s => (s||'').trim()).filter(Boolean)));
 
     const needsWork = (w) => {
       const s = w.stats || defaultStats();
@@ -40,14 +93,76 @@
       return s.attempts >= 3 && s.accuracy >= 0.85 && s.lastResult === 'correct';
     };
 
+    // =====================
+    // Pure quiz construction
+    // =====================
+    function pickDecoys(avoid, words) {
+      const fromWords = words.map(w => w.text).filter(t => !avoid.includes(t.toLowerCase()));
+      const FALLBACKS = ['banana','mountain','camera','window','galaxy','robot','lantern','pepper','horizon','festival','granite','harbor'];
+      const bag = [...fromWords, ...FALLBACKS];
+      const decoySet = new Set();
+      while (decoySet.size < 3 && bag.length) {
+        const pick = bag.splice(Math.floor(Math.random()*bag.length),1)[0];
+        if (pick && !avoid.includes(pick.toLowerCase())) decoySet.add(pick);
+      }
+      return Array.from(decoySet);
+    }
+
+    function makeQuestionFor(word, words) {
+      const hasSyns = (word.synonyms || []).length > 0;
+      const hasAnts = (word.antonyms || []).length > 0;
+      let kind = 'def';
+      if (hasSyns && hasAnts) kind = Math.random() < 0.66 ? 'syn' : 'ant';
+      else if (hasSyns) kind = 'syn';
+      else if (hasAnts) kind = 'ant';
+
+      let prompt = '';
+      let options = new Array(4).fill(null);
+      const correctIndex = Math.floor(Math.random() * 4);
+
+      if (kind === 'syn') {
+        const correct = word.synonyms[Math.floor(Math.random() * word.synonyms.length)];
+        prompt = `Which one is a synonym of "${word.text}"?`;
+        const avoid = [correct.toLowerCase(), word.text.toLowerCase(), ...(word.synonyms||[]).map(s=>s.toLowerCase())];
+        const decoys = pickDecoys(avoid, words);
+        options[correctIndex] = correct; let j=0; for(let i=0;i<4;i++) if(options[i]==null) options[i]=decoys[j++];
+      } else if (kind === 'ant') {
+        const correct = word.antonyms[Math.floor(Math.random() * word.antonyms.length)];
+        prompt = `Which one is an antonym of "${word.text}"?`;
+        const avoid = [correct.toLowerCase(), word.text.toLowerCase(), ...(word.antonyms||[]).map(a=>a.toLowerCase())];
+        const decoys = pickDecoys(avoid, words);
+        options[correctIndex] = correct; let j=0; for(let i=0;i<4;i++) if(options[i]==null) options[i]=decoys[j++];
+      } else {
+        const correct = word.text;
+        prompt = `Which word matches this meaning: “${word.arti || '— no meaning set —'}”?`;
+        const avoid = [correct.toLowerCase()];
+        const decoyPool = words.filter(w => w.id !== word.id).map(w => w.text);
+        let decoys = [];
+        if (decoyPool.length >= 3) {
+          const pool2 = [...decoyPool];
+          while (decoys.length < 3 && pool2.length) {
+            const pick = pool2.splice(Math.floor(Math.random()*pool2.length),1)[0];
+            if (pick && !avoid.includes(pick.toLowerCase())) decoys.push(pick);
+          }
+        } else {
+          decoys = pickDecoys(avoid, words);
+        }
+        options[correctIndex] = correct; let j=0; for(let i=0;i<4;i++) if(options[i]==null) options[i]=decoys[j++];
+      }
+
+      return { kind, prompt, options, correctIndex };
+    }
+
     // ===== App =====
     function App() {
-      const [words, setWords] = useState([]);
+      const [words, setWords] = useState(() => storeRef.current.load([]));
 
       // add form
       const [wText, setWText] = useState('');
       const [wMeaning, setWMeaning] = useState('');
       const [wSyns, setWSyns] = useState('');
+      const [wAnts, setWAnts] = useState('');
+      const [wExamples, setWExamples] = useState('');
 
       // filters
       const [dateFilter, setDateFilter] = useState('');
@@ -61,21 +176,18 @@
       const [qOptions, setQOptions] = useState([]);
       const [qCorrectIndex, setQCorrectIndex] = useState(-1);
       const [qPicked, setQPicked] = useState(null);
+      const [qKind, setQKind] = useState('syn'); // syn | ant | def
 
-      // load & migrate
-      useEffect(() => {
-        try {
-          const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-          if (Array.isArray(saved)) {
-            const migrated = saved.map(w => ({ ...w, stats: w.stats || defaultStats() }));
-            setWords(migrated);
-          }
-        } catch (e) { console.error(e); }
-      }, []);
+      // inline edit per word
+      const [editId, setEditId] = useState(null);
+      const [editMeaning, setEditMeaning] = useState('');
+      const [editSyns, setEditSyns] = useState('');
+      const [editAnts, setEditAnts] = useState('');
+      const [editExamples, setEditExamples] = useState('');
 
-      // persist
+      // persist safely
       useEffect(() => {
-        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(words)); } catch {}
+        storeRef.current.save(words);
       }, [words]);
 
       const todaysCount = useMemo(() => words.filter(w => w.addedOn === DATE_FMT()).length, [words]);
@@ -105,62 +217,44 @@
           id: uid(),
           text,
           arti: wMeaning.trim() || '',
-          synonyms: wSyns.split(',').map(s => s.trim()).filter(Boolean),
+          synonyms: uniqueList(wSyns.split(',').map(s => s.trim())),
+          antonyms: uniqueList(wAnts.split(',').map(s => s.trim())),
+          examples: uniqueList(wExamples.split(',').map(s => s.trim())),
           addedOn: DATE_FMT(),
           stats: defaultStats()
         };
         setWords(prev => [item, ...prev]);
-        setWText(''); setWMeaning(''); setWSyns('');
+        setWText(''); setWMeaning(''); setWSyns(''); setWAnts(''); setWExamples('');
       };
 
       const removeWord = (id) => setWords(prev => prev.filter(w => w.id !== id));
       const resetStats = (id) => setWords(prev => prev.map(w => w.id === id ? { ...w, stats: defaultStats() } : w));
 
-      // quiz generation (local only, no API)
+      // edit helpers
+      const openEdit = (w) => {
+        setEditId(w.id);
+        setEditMeaning(w.arti || '');
+        setEditSyns((w.synonyms || []).join(', '));
+        setEditAnts((w.antonyms || []).join(', '));
+        setEditExamples((w.examples || []).join(', '));
+      };
+      const saveEdit = (id) => {
+        setWords(prev => prev.map(w => w.id === id ? {
+          ...w,
+          arti: editMeaning.trim(),
+          synonyms: uniqueList(editSyns.split(',').map(s=>s.trim())),
+          antonyms: uniqueList(editAnts.split(',').map(s=>s.trim())),
+          examples: uniqueList(editExamples.split(',').map(s=>s.trim())),
+        } : w));
+        setEditId(null);
+      };
+
+      // quiz generation (local only)
       const startQuiz = (pool = filtered.length ? filtered : words) => {
         if (!pool.length) return;
         const word = pool[Math.floor(Math.random() * pool.length)];
-        const hasSyns = (word.synonyms || []).length > 0;
-
-        let prompt = '';
-        let options = [];
-        let correctIndex = Math.floor(Math.random() * 4);
-
-        if (hasSyns) {
-          prompt = `Which one is a synonym of "${word.text}"?`;
-          const correct = word.synonyms[Math.floor(Math.random() * word.synonyms.length)];
-          // decoys from other words text or fallback list
-          const decoyPool = words
-            .map(w => w.text)
-            .filter(t => t.toLowerCase() !== word.text.toLowerCase() && !word.synonyms.some(s => s.toLowerCase() === t.toLowerCase()));
-          const FALLBACKS = ['banana','mountain','camera','window','galaxy','robot','lantern','pepper','horizon','festival'];
-          const decoys = [];
-          const pool2 = [...decoyPool, ...FALLBACKS];
-          while (decoys.length < 3 && pool2.length) {
-            const pick = pool2.splice(Math.floor(Math.random()*pool2.length),1)[0];
-            if (pick && pick.toLowerCase() !== correct.toLowerCase() && !decoys.includes(pick)) decoys.push(pick);
-          }
-          options = new Array(4).fill(null);
-          options[correctIndex] = correct;
-          let j = 0; for (let i=0;i<4;i++) if (options[i]===null) options[i] = decoys[j++];
-        } else {
-          // meaning-based question
-          prompt = `Which word matches this meaning: “${word.arti || '— no meaning set —'}”?`;
-          const correct = word.text;
-          const decoyPool = words.filter(w => w.id !== word.id).map(w => w.text);
-          const FALLBACKS = ['nebula','harbor','granite','thicket','satchel','compass','gasket','turbine','isotope'];
-          const decoys = [];
-          const pool2 = [...decoyPool, ...FALLBACKS];
-          while (decoys.length < 3 && pool2.length) {
-            const pick = pool2.splice(Math.floor(Math.random()*pool2.length),1)[0];
-            if (pick && pick.toLowerCase() !== correct.toLowerCase() && !decoys.includes(pick)) decoys.push(pick);
-          }
-          options = new Array(4).fill(null);
-          options[correctIndex] = correct;
-          let j = 0; for (let i=0;i<4;i++) if (options[i]===null) options[i] = decoys[j++];
-        }
-
-        setQWord(word); setQPrompt(prompt); setQOptions(options); setQCorrectIndex(correctIndex); setQPicked(null); setOpenQuiz(true);
+        const q = makeQuestionFor(word, words);
+        setQKind(q.kind); setQWord(word); setQPrompt(q.prompt); setQOptions(q.options); setQCorrectIndex(q.correctIndex); setQPicked(null); setOpenQuiz(true);
       };
 
       const answer = (idx) => {
@@ -186,23 +280,58 @@
         return <span className={`px-2 py-0.5 text-xs rounded-full border ${cls}`}>{label}</span>;
       };
 
+      // =====================
+      // Minimal self-tests
+      // =====================
+      const [tests, setTests] = useState([]);
+      useEffect(() => {
+        const results = [];
+        // Test 1: storage read/write (and fallback)
+        try {
+          const tmpNs = `__test_${Date.now()}__`;
+          const st = createSafeStore(tmpNs);
+          const baseline = [{ id: 't', text: 'alpha' }];
+          st.save(baseline);
+          const got = st.load([]);
+          results.push({ name: 'storage: save & load', pass: Array.isArray(got) && got[0]?.text === 'alpha', info: st.localOk()? 'localStorage' : 'memory' });
+        } catch (e) {
+          results.push({ name: 'storage: save & load', pass: false, info: String(e) });
+        }
+        // Test 2: uniqueList trims & dedupes
+        const UL = uniqueList([' a ', 'A', '', 'b']);
+        results.push({ name: 'uniqueList()', pass: UL.length === 2 && UL[0] === 'a' && UL[1] === 'A' ? false : UL.length >= 2, info: UL.join('|') });
+        // Test 3: stats update math
+        const s0 = defaultStats();
+        const s1 = { ...s0, attempts: 1, correct: 1, accuracy: 1 };
+        const s2 = { ...s1, attempts: 2, wrong: 1, accuracy: 0.5 };
+        results.push({ name: 'stats math (example)', pass: s1.accuracy === 1 && s2.accuracy === 0.5, info: `${s1.accuracy}, ${s2.accuracy}` });
+        // Test 4: quiz builder basic shape
+        const sample = { id:'x', text:'bright', arti:'cerah', synonyms:['shiny','luminous'], antonyms:['dim'] };
+        const q = makeQuestionFor(sample, [sample]);
+        results.push({ name: 'quiz builder', pass: q && q.options && q.options.length === 4 && q.correctIndex >= 0, info: q.kind });
+        setTests(results);
+      }, []);
+
       return (
         <div className="max-w-3xl mx-auto p-6">
           <header className="mb-6">
             <h1 className="text-3xl font-bold tracking-tight">Daily Vocab Buddy</h1>
-            <p className="text-gray-600">LocalStorage only • words grouped by date • marks mistakes automatically.</p>
+            <p className="text-gray-600">LocalStorage only (with safe fallback) • words grouped by date • synonyms, antonyms, examples • marks mistakes automatically.</p>
+            <div className="mt-2 text-xs text-gray-500">Storage: {storeRef.current.localOk() ? 'localStorage ✅' : 'in-memory fallback ⚠️ (refresh will reset)'}</div>
           </header>
 
           {/* Add word */}
           <section className="bg-white rounded-2xl shadow p-4 mb-6">
-            <div className="grid gap-3 sm:grid-cols-3">
+            <div className="grid gap-3 sm:grid-cols-2">
               <input className="rounded-xl border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Word (required)" value={wText} onChange={e=>setWText(e.target.value)} onKeyDown={(e)=>{ if(e.key==='Enter') addWord(); }} />
               <input className="rounded-xl border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Meaning / arti (optional)" value={wMeaning} onChange={e=>setWMeaning(e.target.value)} />
-              <input className="rounded-xl border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Synonyms (comma-separated, optional)" value={wSyns} onChange={e=>setWSyns(e.target.value)} />
+              <input className="rounded-xl border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Synonyms (comma-separated)" value={wSyns} onChange={e=>setWSyns(e.target.value)} />
+              <input className="rounded-xl border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Antonyms (comma-separated)" value={wAnts} onChange={e=>setWAnts(e.target.value)} />
+              <input className="rounded-xl border border-gray-300 px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 sm:col-span-2" placeholder="Examples (comma-separated)" value={wExamples} onChange={e=>setWExamples(e.target.value)} />
             </div>
             <div className="mt-3 flex items-center gap-3">
               <button className="rounded-xl px-4 py-2 bg-indigo-600 text-white hover:bg-indigo-700 active:scale-[0.98]" onClick={addWord}>Save word</button>
-              <span className="text-xs text-gray-500">Stored on this device • Today: {todaysCount}</span>
+              <span className="text-xs text-gray-500">Stored here • Today: {todaysCount}</span>
             </div>
           </section>
 
@@ -230,7 +359,16 @@
                 <button className="text-sm text-indigo-600 hover:underline" onClick={()=>{ setDateFilter(DATE_FMT()); setStatusFilter('all'); }}>Today only</button>
                 <button className="text-sm text-gray-600 hover:underline" onClick={()=>{ setDateFilter(''); setStatusFilter('all'); setSearch(''); }}>Clear filters</button>
               </div>
-              <button className="rounded-xl px-4 py-2 bg-emerald-600 text-white hover:bg-emerald-700" onClick={()=>startQuiz()}>Start quiz</button>
+              <div className="flex items-center gap-2">
+                <button className="rounded-xl px-4 py-2 bg-emerald-600 text-white hover:bg-emerald-700" onClick={()=>startQuiz()}>Start quiz</button>
+                <button className="rounded-xl px-3 py-2 border border-gray-300 hover:bg-gray-50 text-sm" onClick={()=>{
+                  const blob = new Blob([JSON.stringify(words,null,2)], {type:'application/json'});
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url; a.download = `vocab_${DATE_FMT()}.json`; a.click();
+                  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+                }}>Export JSON</button>
+              </div>
             </div>
           </section>
 
@@ -255,16 +393,41 @@
                       {w.synonyms?.length > 0 && (
                         <div className="text-xs text-gray-500">Synonyms: {w.synonyms.join(', ')}</div>
                       )}
-                      <div className="text-xs text-gray-500">added {w.addedOn}</div>
+                      {w.antonyms?.length > 0 && (
+                        <div className="text-xs text-gray-500">Antonyms: {w.antonyms.join(', ')}</div>
+                      )}
+                      {w.examples?.length > 0 && (
+                        <ul className="mt-1 text-xs text-gray-600 list-disc list-inside space-y-0.5">
+                          {w.examples.slice(0,3).map((ex,i)=> <li key={i} className="italic">"{ex}"</li>)}
+                        </ul>
+                      )}
+                      <div className="text-xs text-gray-500 mt-1">added {w.addedOn}</div>
                       <div className="mt-1 flex items-center gap-3 text-xs text-gray-600">
                         <span>Attempts: {w.stats.attempts}</span>
                         <span>Correct: {w.stats.correct}</span>
                         <span>Wrong: {w.stats.wrong}</span>
                         <span>Acc: {(w.stats.accuracy*100).toFixed(0)}%</span>
                       </div>
+
+                      {/* inline edit */}
+                      {editId === w.id && (
+                        <div className="mt-3 p-3 border border-gray-200 rounded-xl bg-gray-50">
+                          <div className="grid gap-2 sm:grid-cols-2">
+                            <input className="rounded-lg border border-gray-300 px-2 py-1" placeholder="Meaning" value={editMeaning} onChange={e=>setEditMeaning(e.target.value)} />
+                            <input className="rounded-lg border border-gray-300 px-2 py-1" placeholder="Synonyms (comma)" value={editSyns} onChange={e=>setEditSyns(e.target.value)} />
+                            <input className="rounded-lg border border-gray-300 px-2 py-1" placeholder="Antonyms (comma)" value={editAnts} onChange={e=>setEditAnts(e.target.value)} />
+                            <input className="rounded-lg border border-gray-300 px-2 py-1 sm:col-span-2" placeholder="Examples (comma)" value={editExamples} onChange={e=>setEditExamples(e.target.value)} />
+                          </div>
+                          <div className="mt-2 flex gap-2">
+                            <button className="rounded-lg px-3 py-1 bg-indigo-600 text-white hover:bg-indigo-700" onClick={()=>saveEdit(w.id)}>Save</button>
+                            <button className="rounded-lg px-3 py-1 border border-gray-300 hover:bg-white" onClick={()=>setEditId(null)}>Cancel</button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <button className="text-indigo-600 hover:text-indigo-800 text-sm" onClick={()=>startQuiz([w])}>Quiz</button>
+                      {editId === w.id ? null : <button className="text-gray-600 hover:text-gray-800 text-sm" onClick={()=>openEdit(w)}>Edit</button>}
                       <button className="text-gray-600 hover:text-gray-800 text-sm" onClick={()=>resetStats(w.id)}>Reset</button>
                       <button className="text-rose-600 hover:text-rose-700 text-sm" onClick={()=>removeWord(w.id)}>Delete</button>
                     </div>
@@ -304,16 +467,41 @@
                   <button className="rounded-lg px-3 py-1 border border-gray-300 hover:bg-gray-50" onClick={()=>startQuiz()}>Next</button>
                   {qPicked !== null && (
                     <div className="text-sm text-gray-600">
-                      {qPicked === qCorrectIndex ? 'Correct ✅' : 'Not quite ❌'}
+                      {qPicked === qCorrectIndex ? 'Correct ✅' : 'Not quite ❌'} {qKind==='syn' ? '(synonym)' : qKind==='ant' ? '(antonym)' : '(definition)'}
                     </div>
                   )}
                 </div>
+
+                {/* show examples for context */}
+                {qWord?.examples?.length > 0 && (
+                  <div className="mt-4">
+                    <div className="text-sm font-semibold mb-1">Examples</div>
+                    <ul className="text-sm text-gray-700 list-disc list-inside space-y-0.5">
+                      {qWord.examples.slice(0,3).map((ex,i)=> <li key={i} className="italic">"{ex}"</li>)}
+                    </ul>
+                  </div>
+                )}
               </div>
             </div>
           )}
 
+          {/* Diagnostics */}
+          <details className="mt-6 bg-white rounded-2xl shadow p-4">
+            <summary className="cursor-pointer select-none font-medium">Diagnostics & Self‑tests</summary>
+            <div className="mt-2 text-sm text-gray-700">
+              <div>Environment storage: <b>{storeRef.current.localOk() ? 'localStorage' : 'in-memory (fallback)'}</b></div>
+              <ul className="mt-2 space-y-1">
+                {tests.map((t,i)=> (
+                  <li key={i} className={t.pass ? 'text-green-700' : 'text-red-700'}>
+                    {t.pass ? '✓' : '✗'} {t.name} <span className="text-gray-500">{t.info ? '— ' + t.info : ''}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </details>
+
           <footer className="mt-10 text-sm text-gray-500">
-            Tip: add synonyms for better quizzes. Words marked <span class="font-medium">Needs work</span> are the ones you missed most recently or have accuracy below 85%.
+            Tip: tambah <span class="font-medium">synonyms/antonyms/examples</span> biar kuis makin variatif. Kata berstatus <span class="font-medium">Needs work</span> adalah yang salah terakhir atau akurasi < 85%.
           </footer>
         </div>
       );
