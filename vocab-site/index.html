@@ -15,7 +15,7 @@
   <div class="hidden bg-green-50 text-green-700 border-green-300 bg-amber-50 text-amber-700 border-amber-300 bg-red-50 text-red-700 border-red-300"></div>
   <div id="root"></div>
 
-  <script type="text/babel">
+  <script type="text/babel" data-presets="env,react">
     const { useEffect, useMemo, useRef, useState } = React;
 
     // =============================
@@ -501,7 +501,7 @@
           </details>
 
           <footer className="mt-10 text-sm text-gray-500">
-            Tip: tambah <span class="font-medium">synonyms/antonyms/examples</span> biar kuis makin variatif. Kata berstatus <span class="font-medium">Needs work</span> adalah yang salah terakhir atau akurasi < 85%.
+            Tip: tambah <span className="font-medium">synonyms/antonyms/examples</span> biar kuis makin variatif. Kata berstatus <span className="font-medium">Needs work</span> adalah yang salah terakhir atau akurasi &lt; 85%.
           </footer>
         </div>
       );
